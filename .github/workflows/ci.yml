@@ -6,6 +6,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -32,24 +33,9 @@ jobs:
       - name: Build Linux release binary
         run: cargo build --release --locked
 
-      - name: Upload binary artifact
+      - name: Upload release candidate
         uses: actions/upload-artifact@v4
         with:
-          name: shipyard-api-linux
+          name: shipyard-api-${{ github.sha }}
           path: target/release/shipyard-api
           retention-days: 7
-
-      - name: Configure AWS credentials
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Upload release to S3
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-            aws s3 cp target/release/shipyard-api \
-                "s3://shipyard-artifacts-123/releases/${GITHUB_SHA}/shipyard-api" \
-                --region ap-south-2
