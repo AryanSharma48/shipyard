@@ -1,3 +1,4 @@
+
 name: Shipyard Release
 
 on:
@@ -9,33 +10,19 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download tested binary
+        uses: actions/download-artifact@v4
         with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Build Linux release binary
-        run: cargo build --release --locked
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shipyard-api-${{ github.ref_name }}
-          path: target/release/shipyard-api
-          retention-days: 7
+          name: shipyard-api-${{ github.sha }}
+          path: release
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -48,6 +35,36 @@ jobs:
         env:
           RELEASE_SHA: ${{ github.sha }}
         run: |
-          aws s3 cp target/release/shipyard-api \
+          aws s3 cp release/shipyard-api \
             "s3://shipyard-artifacts-123/releases/${RELEASE_SHA}/shipyard-api" \
             --region ap-southeast-2
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.EC2_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/shipyard_deploy
+          chmod 600 ~/.ssh/shipyard_deploy
+
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy release to EC2
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh \
+            -i ~/.ssh/shipyard_deploy \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "sudo -n /opt/shipyard/deploy.sh '$RELEASE_SHA'"
