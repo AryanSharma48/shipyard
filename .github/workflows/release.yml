@@ -39,32 +39,77 @@ jobs:
             "s3://shipyard-artifacts-123/releases/${RELEASE_SHA}/shipyard-api" \
             --region ap-southeast-2
 
+  
   deploy:
     needs: publish
     runs-on: ubuntu-latest
 
     steps:
-      - name: Configure SSH
-        env:
-          DEPLOY_KEY: ${{ secrets.EC2_DEPLOY_KEY }}
-          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
-        run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/shipyard_deploy
-          chmod 600 ~/.ssh/shipyard_deploy
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Deploy release to EC2
+      - name: Deploy release through SSM
         env:
           RELEASE_SHA: ${{ github.sha }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        shell: bash
         run: |
-          ssh \
-            -i ~/.ssh/shipyard_deploy \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            "$EC2_USER@$EC2_HOST" \
-            "sudo -n /opt/shipyard/deploy.sh '$RELEASE_SHA'"
+          set -euo pipefail
+
+          # Ask SSM to run the existing deployment script.
+          jq -n --arg cmd \
+            "sudo -n /opt/shipyard/deploy.sh ${RELEASE_SHA}" \
+            '{commands: [$cmd]}' > parameters.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region ap-southeast-2 \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://parameters.json \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+
+          # Wait for deployment to finish (maximum ~10 minutes).
+          for i in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region ap-southeast-2 \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --region ap-southeast-2 \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --region ap-southeast-2 \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '[StatusDetails,StandardOutputContent,StandardErrorContent]' \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSM deployment."
+          exit 1
+
