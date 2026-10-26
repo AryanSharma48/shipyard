@@ -45,10 +45,11 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-2
+          aws-region: ap-east-1
 
       - name: Upload release to S3
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          aws s3 cp target/release/shipyard-api \
-            "s3://shipyard-artifacts-123/releases/${GITHUB_SHA}/shipyard-api"
+            aws s3 cp target/release/shipyard-api \
+                "s3://shipyard-artifacts-123/releases/${GITHUB_SHA}/shipyard-api" \
+                --region ap-south-2
