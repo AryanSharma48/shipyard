@@ -10,6 +10,7 @@ use std::fmt;
 pub enum ApiError {
     BadRequest(String),
     NotFound(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -23,6 +24,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::BadRequest(msg) => write!(f, "Bad request: {msg}"),
             ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
             ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
         }
     }
@@ -35,6 +37,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
