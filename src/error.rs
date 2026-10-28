@@ -1,0 +1,44 @@
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+use std::fmt;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    Internal(String),
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiError::BadRequest(msg) => write!(f, "Bad request: {msg}"),
+            ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+        };
+
+        let body = Json(ErrorResponse { error: message });
+        (status, body).into_response()
+    }
+}

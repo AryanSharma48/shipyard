@@ -3,3 +3,6 @@
 .env.*
 !.env.example
 *.pem
+.agent*
+prd.md
+skills-lock.json

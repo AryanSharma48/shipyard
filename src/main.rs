@@ -1,23 +1,10 @@
-use axum::{Json, Router, routing::get};
-use serde::Serialize;
+use shipyard_api::{AppState, create_app};
 use tokio::net::TcpListener;
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    service: &'static str,
-}
-
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "shipyard-api",
-    })
-}
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/health", get(health));
+    let state = AppState::in_memory();
+    let app = create_app(state);
 
     let listener = TcpListener::bind("127.0.0.1:3000")
         .await
@@ -30,7 +17,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use shipyard_api::routes::health::health;
 
     #[tokio::test]
     async fn health_returns_ok() {
