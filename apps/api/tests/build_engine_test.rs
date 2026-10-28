@@ -5,7 +5,10 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use shipyard_api::adapter::MockRuntimeAdapter;
-use shipyard_api::builder::{BuildWorker, NodeDetector, PackageManager};
+use shipyard_api::builder::{
+    BuildWorker, ContainerRunner, DockerfileGenerator, MockContainerRunner, NodeDetector,
+    NodeProjectConfig, PackageManager,
+};
 use shipyard_api::models::{Build, BuildStatus, DeploymentStatus, Project};
 use shipyard_api::queue::{BuildJob, JobQueue, MemoryJobQueue};
 use shipyard_api::store::{MemoryProjectStore, ProjectStore};
@@ -453,4 +456,129 @@ async fn test_webhook_to_automated_deployment_full_loop() {
 
     let get_dep_res = app.clone().oneshot(get_dep_req).await.unwrap();
     assert_eq!(get_dep_res.status(), StatusCode::OK);
+}
+
+#[test]
+fn test_dockerfile_generator_npm_with_build() {
+    let config = NodeProjectConfig {
+        package_manager: PackageManager::Npm,
+        install_command: "npm ci".to_string(),
+        build_command: Some("npm run build".to_string()),
+        start_command: "node dist/index.js".to_string(),
+    };
+
+    let dockerfile = DockerfileGenerator::generate(&config, Some("20-alpine"));
+
+    // Check multi-stage structure
+    assert!(dockerfile.contains("FROM node:20-alpine AS deps"));
+    assert!(dockerfile.contains("COPY package.json package-lock.json* ./"));
+    assert!(dockerfile.contains("RUN npm ci"));
+
+    // Check builder stage
+    assert!(dockerfile.contains("FROM node:20-alpine AS builder"));
+    assert!(dockerfile.contains("RUN npm run build"));
+
+    // Check runner stage and security invariants
+    assert!(dockerfile.contains("FROM node:20-alpine AS runner"));
+    assert!(dockerfile.contains("ENV NODE_ENV=production"));
+    assert!(dockerfile.contains("USER node"));
+    assert!(dockerfile.contains("EXPOSE 3000"));
+    assert!(dockerfile.contains("CMD [\"node\", \"dist/index.js\"]"));
+}
+
+#[test]
+fn test_dockerfile_generator_pnpm() {
+    let config = NodeProjectConfig {
+        package_manager: PackageManager::Pnpm,
+        install_command: "pnpm install --frozen-lockfile".to_string(),
+        build_command: None,
+        start_command: "pnpm start".to_string(),
+    };
+
+    let dockerfile = DockerfileGenerator::generate(&config, None);
+
+    assert!(dockerfile.contains("pnpm-lock.yaml*"));
+    assert!(dockerfile.contains("RUN corepack enable && corepack prepare pnpm@latest --activate"));
+    assert!(dockerfile.contains("RUN pnpm install --frozen-lockfile"));
+    assert!(dockerfile.contains("CMD [\"pnpm\", \"start\"]"));
+}
+
+#[test]
+fn test_dockerfile_generator_yarn() {
+    let config = NodeProjectConfig {
+        package_manager: PackageManager::Yarn,
+        install_command: "yarn install --frozen-lockfile".to_string(),
+        build_command: Some("yarn run build".to_string()),
+        start_command: "yarn start".to_string(),
+    };
+
+    let dockerfile = DockerfileGenerator::generate(&config, Some("22-alpine"));
+
+    assert!(dockerfile.contains("FROM node:22-alpine AS deps"));
+    assert!(dockerfile.contains("yarn.lock*"));
+    assert!(dockerfile.contains("RUN corepack enable && corepack prepare yarn@stable --activate"));
+    assert!(dockerfile.contains("RUN yarn install --frozen-lockfile"));
+}
+
+#[tokio::test]
+async fn test_container_runner_mock_build_and_logs() {
+    let runner = MockContainerRunner::new();
+    let project_id = Uuid::new_v4();
+    let commit_sha = "mock-sha-999";
+    let dockerfile = "FROM node:20-alpine\nCMD [\"node\", \"index.js\"]";
+
+    let result = runner
+        .build_image(project_id, commit_sha, dockerfile)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.image_tag,
+        format!("shipyard/{}:{}", project_id, commit_sha)
+    );
+    assert!(result.image_digest.starts_with("sha256:"));
+    assert_eq!(result.logs.len(), 5);
+    assert!(result.logs[0].contains("Reading Dockerfile"));
+}
+
+#[tokio::test]
+async fn test_build_worker_with_custom_runner_and_logs() {
+    let store = Arc::new(MemoryProjectStore::new());
+    let queue = Arc::new(MemoryJobQueue::new());
+    let runner = Arc::new(MockContainerRunner::new());
+    let worker = BuildWorker::with_runner(store.clone(), queue.clone(), None, runner);
+
+    let project_id = Uuid::new_v4();
+    let build_id = Uuid::new_v4();
+
+    let build = Build {
+        id: build_id,
+        project_id,
+        commit_sha: "runner-test-commit".to_string(),
+        branch: "main".to_string(),
+        status: BuildStatus::Queued,
+        image_digest: None,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+        failure_reason: None,
+    };
+    store.create_build(build).await.unwrap();
+
+    let job = BuildJob::new(
+        build_id,
+        project_id,
+        "runner-test-commit".to_string(),
+        "main".to_string(),
+        "https://github.com/org/repo".to_string(),
+    );
+    queue.enqueue(job).await.unwrap();
+
+    let processed = worker.process_one_job().await.unwrap();
+    assert!(processed.is_some());
+    let finished = processed.unwrap();
+
+    assert_eq!(finished.status, BuildStatus::Succeeded);
+    assert!(finished.image_digest.is_some());
+    assert!(finished.image_digest.unwrap().starts_with("sha256:"));
 }

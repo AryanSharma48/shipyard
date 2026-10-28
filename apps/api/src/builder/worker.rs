@@ -1,15 +1,18 @@
 use crate::adapter::RuntimeAdapter;
+use crate::builder::detector::{NodeProjectConfig, PackageManager};
+use crate::builder::docker::{ContainerRunner, MockContainerRunner};
+use crate::builder::docker_template::DockerfileGenerator;
 use crate::error::ApiError;
 use crate::models::{Build, BuildStatus, Deployment};
 use crate::queue::{BuildJob, JobQueue};
 use crate::store::ProjectStore;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub struct BuildWorker {
     pub store: Arc<dyn ProjectStore>,
     pub queue: Arc<dyn JobQueue>,
     pub adapter: Option<Arc<dyn RuntimeAdapter>>,
+    pub runner: Arc<dyn ContainerRunner>,
 }
 
 impl BuildWorker {
@@ -18,6 +21,7 @@ impl BuildWorker {
             store,
             queue,
             adapter: None,
+            runner: Arc::new(MockContainerRunner::new()),
         }
     }
 
@@ -30,6 +34,21 @@ impl BuildWorker {
             store,
             queue,
             adapter: Some(adapter),
+            runner: Arc::new(MockContainerRunner::new()),
+        }
+    }
+
+    pub fn with_runner(
+        store: Arc<dyn ProjectStore>,
+        queue: Arc<dyn JobQueue>,
+        adapter: Option<Arc<dyn RuntimeAdapter>>,
+        runner: Arc<dyn ContainerRunner>,
+    ) -> Self {
+        Self {
+            store,
+            queue,
+            adapter,
+            runner,
         }
     }
 
@@ -93,28 +112,28 @@ impl BuildWorker {
             .update_build_status(job.build_id, BuildStatus::Building, None, None)
             .await?;
 
-        // Check for simulated failure
-        if job.commit_sha.contains("fail") {
-            return Err(ApiError::Internal(format!(
-                "Build compilation failed for commit '{}'",
-                job.commit_sha
-            )));
-        }
+        // 1. Synthesize multi-stage Dockerfile
+        let config = NodeProjectConfig {
+            package_manager: PackageManager::Npm,
+            install_command: "npm ci".to_string(),
+            build_command: Some("npm run build".to_string()),
+            start_command: "node server.js".to_string(),
+        };
+        let dockerfile = DockerfileGenerator::generate(&config, Some("20-alpine"));
 
-        // Generate simulated container image digest (SHA256 of project + commit)
-        let mut hasher = Sha256::new();
-        hasher.update(job.project_id.as_bytes());
-        hasher.update(job.commit_sha.as_bytes());
-        let digest_bytes = hasher.finalize();
-        let image_digest = format!("sha256:{}", hex::encode(digest_bytes));
+        // 2. Build container image via ContainerRunner
+        let result = self
+            .runner
+            .build_image(job.project_id, &job.commit_sha, &dockerfile)
+            .await?;
 
-        // Transition: Building -> Succeeded
+        // 3. Transition: Building -> Succeeded with real container image digest
         let finished = self
             .store
             .update_build_status(
                 job.build_id,
                 BuildStatus::Succeeded,
-                Some(image_digest),
+                Some(result.image_digest),
                 None,
             )
             .await?;
