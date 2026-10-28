@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod builder;
 pub mod error;
 pub mod models;
+pub mod orchestrator;
 pub mod queue;
 pub mod routes;
 pub mod store;

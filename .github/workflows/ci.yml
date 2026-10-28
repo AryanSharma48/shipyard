@@ -4,8 +4,18 @@ name: Shipyard CI
 on:
   push:
     branches: [main]
+    paths:
+      - "apps/api/**"
+      - "Cargo.*"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "apps/api/**"
+      - "Cargo.*"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
   workflow_call:
 
 permissions:

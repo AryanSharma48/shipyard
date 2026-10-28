@@ -4,8 +4,9 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use shipyard_api::adapter::MockRuntimeAdapter;
 use shipyard_api::builder::{BuildWorker, NodeDetector, PackageManager};
-use shipyard_api::models::{Build, BuildStatus};
+use shipyard_api::models::{Build, BuildStatus, DeploymentStatus, Project};
 use shipyard_api::queue::{BuildJob, JobQueue, MemoryJobQueue};
 use shipyard_api::store::{MemoryProjectStore, ProjectStore};
 use shipyard_api::{AppState, create_app};
@@ -246,4 +247,210 @@ async fn test_webhook_enqueues_to_job_queue() {
 
     // Queue is now empty
     assert_eq!(queue.len().await, 0);
+}
+
+#[tokio::test]
+async fn test_build_worker_automated_deployment_success() {
+    let store = Arc::new(MemoryProjectStore::new());
+    let queue = Arc::new(MemoryJobQueue::new());
+    let adapter = Arc::new(MockRuntimeAdapter::new());
+    let worker = BuildWorker::with_adapter(store.clone(), queue.clone(), adapter.clone());
+
+    let project_id = Uuid::new_v4();
+    let project = Project {
+        id: project_id,
+        name: "auto-deploy-app".to_string(),
+        repo_url: "https://github.com/org/auto-deploy-app".to_string(),
+        default_branch: "main".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store.create_project(project).await.unwrap();
+
+    let build_id = Uuid::new_v4();
+    let build = Build {
+        id: build_id,
+        project_id,
+        commit_sha: "commit-deploy-999".to_string(),
+        branch: "main".to_string(),
+        status: BuildStatus::Queued,
+        image_digest: None,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+        failure_reason: None,
+    };
+    store.create_build(build).await.unwrap();
+
+    let job = BuildJob::new(
+        build_id,
+        project_id,
+        "commit-deploy-999".to_string(),
+        "main".to_string(),
+        "https://github.com/org/auto-deploy-app".to_string(),
+    );
+    queue.enqueue(job).await.unwrap();
+
+    // Process job with deployment
+    let result = worker.process_one_job_with_deployment().await.unwrap();
+    assert!(result.is_some());
+    let (finished_build, triggered_deployment) = result.unwrap();
+
+    // Verify build
+    assert_eq!(finished_build.status, BuildStatus::Succeeded);
+    assert!(finished_build.image_digest.is_some());
+
+    // Verify automated deployment
+    assert!(triggered_deployment.is_some());
+    let dep = triggered_deployment.unwrap();
+    assert_eq!(dep.project_id, project_id);
+    assert_eq!(dep.commit_sha, "commit-deploy-999");
+    assert_eq!(dep.status, DeploymentStatus::Healthy);
+
+    // Verify store has the deployment persisted
+    let deployments = store.list_deployments_by_project(project_id).await.unwrap();
+    assert_eq!(deployments.len(), 1);
+    assert_eq!(deployments[0].status, DeploymentStatus::Healthy);
+}
+
+#[tokio::test]
+async fn test_build_worker_automated_deployment_adapter_failure() {
+    let store = Arc::new(MemoryProjectStore::new());
+    let queue = Arc::new(MemoryJobQueue::new());
+    let adapter = Arc::new(MockRuntimeAdapter::with_failure());
+    let worker = BuildWorker::with_adapter(store.clone(), queue.clone(), adapter);
+
+    let project_id = Uuid::new_v4();
+    let project = Project {
+        id: project_id,
+        name: "failing-deploy-app".to_string(),
+        repo_url: "https://github.com/org/failing-deploy-app".to_string(),
+        default_branch: "main".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store.create_project(project).await.unwrap();
+
+    let build_id = Uuid::new_v4();
+    let build = Build {
+        id: build_id,
+        project_id,
+        commit_sha: "commit-good-adapter-error".to_string(),
+        branch: "main".to_string(),
+        status: BuildStatus::Queued,
+        image_digest: None,
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
+        failure_reason: None,
+    };
+    store.create_build(build).await.unwrap();
+
+    let job = BuildJob::new(
+        build_id,
+        project_id,
+        "commit-good-adapter-error".to_string(),
+        "main".to_string(),
+        "https://github.com/org/failing-deploy-app".to_string(),
+    );
+    queue.enqueue(job).await.unwrap();
+
+    let result = worker.process_one_job_with_deployment().await.unwrap();
+    assert!(result.is_some());
+    let (finished_build, triggered_deployment) = result.unwrap();
+
+    // Invariant: Build still succeeded (container image was built and valid)
+    assert_eq!(finished_build.status, BuildStatus::Succeeded);
+
+    // Deployment failed with reason
+    assert!(triggered_deployment.is_some());
+    let dep = triggered_deployment.unwrap();
+    assert_eq!(dep.status, DeploymentStatus::Failed);
+    assert!(
+        dep.failure_reason
+            .unwrap()
+            .contains("Mock adapter failed to deploy deployment")
+    );
+}
+
+#[tokio::test]
+async fn test_webhook_to_automated_deployment_full_loop() {
+    let store = Arc::new(MemoryProjectStore::new());
+    let queue = Arc::new(MemoryJobQueue::new());
+    let adapter = Arc::new(MockRuntimeAdapter::new());
+    let state = AppState::new(
+        store.clone(),
+        adapter.clone(),
+        queue.clone(),
+        "webhook-full-loop-secret".to_string(),
+    );
+    let app = create_app(state);
+
+    // 1. Create project via API
+    let project_payload = serde_json::json!({
+        "name": "full-loop-service",
+        "repo_url": "https://github.com/org/full-loop-service",
+        "default_branch": "main"
+    });
+    let create_proj_req = Request::builder()
+        .uri("/projects")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(project_payload.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(create_proj_req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let projects = store.list_projects().await.unwrap();
+    let project_id = projects[0].id;
+
+    // 2. Incoming GitHub push webhook
+    let push_body = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "full-loop-sha-456",
+        "repository": {
+            "full_name": "org/full-loop-service"
+        }
+    })
+    .to_string();
+
+    let sig = compute_signature("webhook-full-loop-secret", push_body.as_bytes());
+    let webhook_req = Request::builder()
+        .uri("/webhooks/github")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(Body::from(push_body))
+        .unwrap();
+
+    let webhook_res = app.clone().oneshot(webhook_req).await.unwrap();
+    assert_eq!(webhook_res.status(), StatusCode::ACCEPTED);
+
+    // 3. Queue received job
+    assert_eq!(queue.len().await, 1);
+
+    // 4. Worker processes job with adapter
+    let worker = BuildWorker::with_adapter(store.clone(), queue.clone(), adapter);
+    let processed = worker.process_one_job_with_deployment().await.unwrap();
+    assert!(processed.is_some());
+
+    let (build, deployment) = processed.unwrap();
+    assert_eq!(build.status, BuildStatus::Succeeded);
+    assert!(deployment.is_some());
+
+    let dep = deployment.unwrap();
+    assert_eq!(dep.project_id, project_id);
+    assert_eq!(dep.commit_sha, "full-loop-sha-456");
+    assert_eq!(dep.status, DeploymentStatus::Healthy);
+
+    // 5. Verify deployments endpoint returns healthy deployment
+    let get_dep_req = Request::builder()
+        .uri(format!("/deployments/{}", dep.id))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let get_dep_res = app.clone().oneshot(get_dep_req).await.unwrap();
+    assert_eq!(get_dep_res.status(), StatusCode::OK);
 }
