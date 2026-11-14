@@ -1,3 +1,5 @@
+pub mod postgres;
+
 use crate::error::ApiError;
 use crate::models::{Build, BuildStatus, Deployment, DeploymentStatus, Project};
 use chrono::Utc;
@@ -7,6 +9,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+pub use postgres::PgProjectStore;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -71,7 +75,7 @@ impl MemoryProjectStore {
         }
     }
 
-    fn normalize_repo_url(url: &str) -> String {
+    pub(crate) fn normalize_repo_url(url: &str) -> String {
         let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
         trimmed.to_lowercase()
     }
@@ -125,6 +129,15 @@ impl ProjectStore for MemoryProjectStore {
     ) -> BoxFuture<'_, Result<Deployment, ApiError>> {
         Box::pin(async move {
             let mut lock = self.deployments.write().await;
+            if lock
+                .values()
+                .any(|d| d.project_id == deployment.project_id && d.status.is_active())
+            {
+                return Err(ApiError::Conflict(format!(
+                    "Project '{}' already has an active deployment in progress",
+                    deployment.project_id
+                )));
+            }
             lock.insert(deployment.id, deployment.clone());
             Ok(deployment)
         })
@@ -190,7 +203,21 @@ impl ProjectStore for MemoryProjectStore {
                 deployment.failure_reason = failure_reason;
             }
 
-            Ok(deployment.clone())
+            let updated = deployment.clone();
+            let project_id = updated.project_id;
+
+            if new_status == DeploymentStatus::Healthy {
+                for other in lock.values_mut() {
+                    if other.project_id == project_id
+                        && other.id != id
+                        && other.status == DeploymentStatus::Healthy
+                    {
+                        other.status = DeploymentStatus::Superseded;
+                    }
+                }
+            }
+
+            Ok(updated)
         })
     }
 

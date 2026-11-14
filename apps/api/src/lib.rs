@@ -50,6 +50,17 @@ impl AppState {
         }
     }
 
+    pub fn with_store(store: Arc<dyn ProjectStore>) -> Self {
+        let secret = std::env::var("GITHUB_WEBHOOK_SECRET")
+            .unwrap_or_else(|_| "shipyard-test-secret".to_string());
+        Self {
+            store,
+            adapter: Arc::new(adapter::MockRuntimeAdapter::new()),
+            queue: Arc::new(queue::MemoryJobQueue::new()),
+            webhook_secret: secret,
+        }
+    }
+
     pub fn in_memory_with_secret(webhook_secret: String) -> Self {
         Self {
             store: Arc::new(store::MemoryProjectStore::new()),
