@@ -1,3 +1,4 @@
+use crate::error::ApiError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -13,15 +14,38 @@ pub enum BuildStatus {
 }
 
 impl BuildStatus {
-    pub fn can_transition_to(&self, next: &BuildStatus) -> bool {
-        match (self, next) {
-            (BuildStatus::Queued, BuildStatus::Building) => true,
-            (BuildStatus::Queued, BuildStatus::Cancelled) => true,
-            (BuildStatus::Building, BuildStatus::Succeeded) => true,
-            (BuildStatus::Building, BuildStatus::Failed) => true,
-            (BuildStatus::Building, BuildStatus::Cancelled) => true,
-            _ => false,
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BuildStatus::Queued => "queued",
+            BuildStatus::Building => "building",
+            BuildStatus::Succeeded => "succeeded",
+            BuildStatus::Failed => "failed",
+            BuildStatus::Cancelled => "cancelled",
         }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ApiError> {
+        match value {
+            "queued" => Ok(BuildStatus::Queued),
+            "building" => Ok(BuildStatus::Building),
+            "succeeded" => Ok(BuildStatus::Succeeded),
+            "failed" => Ok(BuildStatus::Failed),
+            "cancelled" => Ok(BuildStatus::Cancelled),
+            other => Err(ApiError::Internal(format!(
+                "Invalid build status in persistence layer: '{other}'"
+            ))),
+        }
+    }
+
+    pub fn can_transition_to(&self, next: &BuildStatus) -> bool {
+        matches!(
+            (self, next),
+            (BuildStatus::Queued, BuildStatus::Building)
+                | (BuildStatus::Queued, BuildStatus::Cancelled)
+                | (BuildStatus::Building, BuildStatus::Succeeded)
+                | (BuildStatus::Building, BuildStatus::Failed)
+                | (BuildStatus::Building, BuildStatus::Cancelled)
+        )
     }
 }
 
