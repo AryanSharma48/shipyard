@@ -53,3 +53,12 @@ pub async fn list_project_deployments(
     let deployments = state.store.list_deployments_by_project(project_id).await?;
     Ok(Json(deployments))
 }
+
+pub async fn rollback_deployment(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Deployment>, ApiError> {
+    let rolled_back =
+        crate::orchestrator::execute_rollback(&state.store, &state.adapter, id).await?;
+    Ok(Json(rolled_back))
+}

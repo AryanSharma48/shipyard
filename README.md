@@ -1,12 +1,14 @@
-# Shipyard
+# Shipyard Cloud
 
-A Rust-powered deployment system providing reproducible releases, automated delivery, and verified host deployments on AWS infrastructure.
+A Rust-powered cloud-native deployment control plane for Node.js web services and APIs, providing reproducible releases, GitHub push-to-deploy webhooks, PostgreSQL persistence, health-gated rollouts, and verified host deployments on AWS infrastructure.
+
+For the full product and architectural specification, see [PRD.md](PRD.md).
 
 ---
 
 ## Architecture
 
-Shipyard automates code delivery from a Git commit to an EC2 host via AWS Systems Manager (SSM), eliminating the need for inbound SSH access.
+Shipyard separates control plane self-deployment (GitHub Actions -> S3 -> AWS SSM -> EC2) from managed application deployments (GitHub Webhook -> Rust Control Plane -> Build Worker -> Runtime Adapter).
 
 ```mermaid
 flowchart TD
@@ -20,19 +22,19 @@ flowchart TD
     Check -->|Fail| Rollback[Automatic Rollback]
 ```
 
-
-### Target Platform Architecture
+### Managed Application Pipeline
 
 ```mermaid
 flowchart TD
-    A[Client Request] --> B[Shipyard API]
-    B --> C[PostgreSQL Metadata]
-    B --> D[Build Queue SQS]
-    D --> E[Isolated Build Workers]
-    E --> F[S3 Artifact Storage]
-    B --> G[Deployment Orchestrator]
-    G --> H[Target Nodes]
-    H --> I[Health Verification]
+    Webhook[POST /webhooks/github] --> API[Shipyard API - Axum/Tokio]
+    API --> PG[(PostgreSQL / Neon via sqlx)]
+    API --> Queue[JobQueue - Memory / SQS]
+    Queue --> Worker[BuildWorker - NodeDetector + DockerfileGenerator]
+    Worker --> Orch[Deploy Orchestrator]
+    Orch --> Adapter[RuntimeAdapter - Mock / ECS Fargate]
+    Adapter --> Gate{Health Verification}
+    Gate -->|Pass| Healthy[Healthy Release]
+    Gate -->|Fail| AutoRB[Auto-Rollback to Prior Healthy Release]
 ```
 
 ---
@@ -41,45 +43,31 @@ flowchart TD
 
 | Component | Technology | Role |
 | :--- | :--- | :--- |
-| **API** | Rust, Axum, Tokio | Asynchronous HTTP service with zero-allocation serialization |
-| **CI/CD** | GitHub Actions | Reusable pipelines for formatting, testing, and release packaging |
-| **Compute** | AWS EC2 (Ubuntu 24.04) | Hosts application binary supervised by systemd |
-| **Artifacts** | Amazon S3 | Private bucket storing immutable binaries keyed by commit SHA |
-| **Deployment** | AWS Systems Manager (SSM) | Outbound HTTPS command execution (replaces inbound SSH) |
-| **Host Automation** | Bash (`/opt/shipyard/deploy.sh`) | Binary validation, backup swap, service restart, and rollback |
+| **Control Plane API** | Rust, Axum, Tokio | Asynchronous HTTP API, state machines, and webhook signature verification |
+| **Persistence** | PostgreSQL (Neon), SQLx | Connection-pooled storage (`PgProjectStore`) and embedded schema migrations |
+| **Build Engine** | Rust (`NodeDetector`, `DockerfileGenerator`) | Package manager detection (`npm`, `pnpm`, `yarn`) and hardened multi-stage Dockerfiles |
+| **CI/CD** | GitHub Actions | Automated formatting, testing (`cargo test --locked`), and release packaging |
+| **Compute** | AWS EC2 (Ubuntu 24.04) | Hosts `shipyard.service` supervised by systemd behind Caddy HTTPS |
+| **Artifacts** | Amazon S3 | Private bucket (`shipyard-artifacts-123`) storing release binaries by commit SHA |
+| **Deployment** | AWS Systems Manager (SSM) | Outbound HTTPS command execution (`/opt/shipyard/deploy.sh`) with local rollback |
 
 ---
 
 ## API Reference
 
-### Health Probe
-
-Probes service availability. Bound to `127.0.0.1:3000` (loopback only).
-
-- **Method**: `GET /health`
-- **Response**: `200 OK`
-
-```json
-{
-  "status": "ok",
-  "service": "shipyard-api"
-}
-```
-
----
-
-## Deployment & Verification Flow
-
-1. **Build & Package**: A version tag (`v*`) triggers `.github/workflows/release.yml`, executing formatting checks (`cargo fmt --check`), test suites (`cargo test --locked`), and release compilation (`cargo build --release --locked`).
-2. **Artifact Publishing**: The validated binary is uploaded to `s3://shipyard-artifacts-123/releases/<SHA>/shipyard-api`.
-3. **SSM Execution**: GitHub Actions invokes `/opt/shipyard/deploy.sh <SHA>` on the EC2 target via SSM Run Command (`AWS-RunShellScript`).
-4. **Host Lifecycle**:
-   - Downloads release binary from S3 using the EC2 instance's IAM role.
-   - Validates ELF executable headers.
-   - Backs up active binary to `shipyard-api.prev`.
-   - Restarts `shipyard.service` via systemd.
-   - Probes `http://127.0.0.1:3000/health`.
-   - Automatically restores `shipyard-api.prev` and exits with an error code if the health check fails.
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Control plane health probe (`{"status":"ok","service":"shipyard-api"}`) |
+| `POST` | `/projects` | Register a project (`name`, `repo_url`, optional `default_branch`) |
+| `GET` | `/projects` | List registered projects ordered by creation timestamp |
+| `GET` | `/projects/{id}` | Retrieve a single project by UUID |
+| `GET` | `/projects/{id}/builds` | List builds for a project |
+| `GET` | `/builds/{id}` | Retrieve a build record and image digest (`sha256:...`) |
+| `POST` | `/deployments` | Trigger a deployment (`project_id`, `commit_sha`, optional `target_type`) |
+| `GET` | `/deployments/{id}` | Retrieve deployment state and diagnostic `failure_reason` |
+| `GET` | `/projects/{id}/deployments` | List deployment history for a project |
+| `POST` | `/deployments/{id}/rollback` | Trigger rollback for a `failed` deployment (`Failed -> RollingBack -> RolledBack`) |
+| `POST` | `/webhooks/github` | Verify `X-Hub-Signature-256`, deduplicate via `X-GitHub-Delivery`, and enqueue builds |
 
 ---
 
@@ -89,20 +77,35 @@ Probes service availability. Bound to `127.0.0.1:3000` (loopback only).
 
 - Rust toolchain (stable, 2024 edition)
 - Cargo
+- Optional: PostgreSQL / Neon connection string in `.env` (falls back to `MemoryProjectStore` if `DATABASE_URL` is unset)
+
+### Environment Variables
+
+Copy `.env.example` to `.env`:
+
+```env
+DATABASE_URL=postgresql://<user>:<password>@<host>/<db>?sslmode=require
+GITHUB_WEBHOOK_SECRET=<your-webhook-secret>
+```
+
+When `DATABASE_URL` is set, `shipyard-api` automatically runs embedded migrations from `apps/api/migrations/` on startup and persists all projects, builds, deployments, and processed webhook delivery IDs in PostgreSQL.
 
 ### Commands
 
 ```bash
 # Check code formatting
-cargo fmt --check
+cargo fmt --all -- --check
 
 # Format codebase automatically
-cargo fmt
+cargo fmt --all
 
-# Run tests
-cargo test --locked
+# Run Clippy lints
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Start service locally (http://127.0.0.1:3000)
+# Run all unit, route, build-engine, and PostgreSQL integration tests
+cargo test --workspace --locked
+
+# Start control plane locally (http://127.0.0.1:3000)
 cargo run
 
 # Build optimized release binary
@@ -113,23 +116,23 @@ cargo build --release --locked
 
 ## Release Procedure
 
-To trigger an automated deployment to infrastructure:
+To trigger an automated deployment to EC2 via `.github/workflows/release.yml`:
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin v0.1.0
+git tag v0.1.5
+git push origin v0.1.5
 ```
 
-GitHub Actions will execute the release workflow, stream execution status, and verify deployment via SSM.
+GitHub Actions executes CI, uploads the Linux release binary to S3, and runs `/opt/shipyard/deploy.sh` via AWS SSM with health verification and automatic local rollback.
 
 ---
 
 ## Roadmap
 
-| Phase | Milestone | Status |
+| Milestone | Scope | Status |
 | :--- | :--- | :--- |
-| **Phase 1** | Single-node pipeline: Rust API, CI, S3 artifacts, systemd, SSM deployment, automated rollback | Implemented (SSM validation in progress) |
-| **Phase 2** | Deployment Management API: CRUD endpoints for deployment tracking, structured tracing | Planned |
-| **Phase 3** | Asynchronous Build Queue: SQS-backed job distribution and isolated build sandboxes | Planned |
-| **Phase 4** | Persistent State & Observability: PostgreSQL metadata storage, deployment history | Planned |
-| **Phase 5** | Multi-Target Rollouts: Blue/green deployments, canary groups, deployment locking | Planned |
+| **Milestone 1** | Infrastructure & CI/CD Foundation (Rust API, GitHub Actions CI/Release, S3 artifacts, SSM EC2 deploy) | Completed |
+| **Milestone 2** | Control Plane Domain & Build Engine (Projects/Builds/Deployments REST API, GitHub webhooks, `NodeDetector`, `DockerfileGenerator`, `BuildWorker`, auto-rollback) | Completed |
+| **Milestone 3** | PostgreSQL Persistence & Database Migrations (`sqlx::migrate!`, `PgProjectStore` on Neon, restart durability, overlapping-deployment guard) | Completed |
+| **Milestone 4** | AWS ECS/Fargate & SQS Integration (`SqsJobQueue`, `EcsRuntimeAdapter`, ECR digest publishing, `infra/` definitions) | Next |
+| **Milestone 5** | Dashboard & Observability (`apps/web/` React + TypeScript + Vite UI, CloudWatch log aggregation) | Planned |

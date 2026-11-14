@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct MockRuntimeAdapter {
     pub should_fail: AtomicBool,
+    pub should_fail_health: AtomicBool,
 }
 
 impl Default for MockRuntimeAdapter {
@@ -18,17 +19,30 @@ impl MockRuntimeAdapter {
     pub fn new() -> Self {
         Self {
             should_fail: AtomicBool::new(false),
+            should_fail_health: AtomicBool::new(false),
         }
     }
 
     pub fn with_failure() -> Self {
         Self {
             should_fail: AtomicBool::new(true),
+            should_fail_health: AtomicBool::new(false),
+        }
+    }
+
+    pub fn with_unhealthy() -> Self {
+        Self {
+            should_fail: AtomicBool::new(false),
+            should_fail_health: AtomicBool::new(true),
         }
     }
 
     pub fn set_should_fail(&self, fail: bool) {
         self.should_fail.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_should_fail_health(&self, fail: bool) {
+        self.should_fail_health.store(fail, Ordering::SeqCst);
     }
 }
 
@@ -49,7 +63,16 @@ impl RuntimeAdapter for MockRuntimeAdapter {
     }
 
     fn check_health(&self, _deployment: &Deployment) -> BoxFuture<'_, Result<bool, ApiError>> {
-        let fails = self.should_fail.load(Ordering::SeqCst);
-        Box::pin(async move { Ok(!fails) })
+        let unhealthy = self.should_fail.load(Ordering::SeqCst)
+            || self.should_fail_health.load(Ordering::SeqCst);
+        Box::pin(async move { Ok(!unhealthy) })
+    }
+
+    fn rollback(
+        &self,
+        _failed_deployment: &Deployment,
+        _previous_healthy: Option<&Deployment>,
+    ) -> BoxFuture<'_, Result<(), ApiError>> {
+        Box::pin(async { Ok(()) })
     }
 }

@@ -340,3 +340,110 @@ async fn test_overlapping_active_deployment_returns_conflict() {
             .contains("active deployment in progress")
     );
 }
+
+#[tokio::test]
+async fn test_unhealthy_deployment_triggers_automatic_rollback_and_preserves_healthy_release() {
+    let adapter = Arc::new(MockRuntimeAdapter::new());
+    let state = AppState::in_memory_with_adapter(adapter.clone());
+    let app = create_app(state);
+
+    let project_id = create_test_project(&app).await;
+
+    // 1. Deploy healthy release v1
+    let v1_payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-good-v1"
+    });
+    let v1_req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(v1_payload.to_string()))
+        .unwrap();
+    let v1_res = app.clone().oneshot(v1_req).await.unwrap();
+    assert_eq!(v1_res.status(), StatusCode::CREATED);
+    let v1_json = response_json(v1_res.into_body()).await;
+    let v1_id = v1_json["id"].as_str().unwrap();
+    assert_eq!(v1_json["status"], "healthy");
+
+    // 2. Simulate health verification failure on release v2
+    adapter.set_should_fail_health(true);
+
+    let v2_payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-bad-v2"
+    });
+    let v2_req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(v2_payload.to_string()))
+        .unwrap();
+    let v2_res = app.clone().oneshot(v2_req).await.unwrap();
+    assert_eq!(v2_res.status(), StatusCode::CREATED);
+    let v2_json = response_json(v2_res.into_body()).await;
+    assert_eq!(v2_json["status"], "rolled_back");
+    assert!(
+        v2_json["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("Health check verification failed")
+    );
+
+    // 3. Verify v1 remained healthy (not superseded)
+    let get_v1_req = Request::builder()
+        .uri(format!("/deployments/{v1_id}"))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let get_v1_res = app.oneshot(get_v1_req).await.unwrap();
+    assert_eq!(get_v1_res.status(), StatusCode::OK);
+    let refreshed_v1 = response_json(get_v1_res.into_body()).await;
+    assert_eq!(refreshed_v1["status"], "healthy");
+}
+
+#[tokio::test]
+async fn test_manual_rollback_endpoint_transitions_failed_to_rolled_back() {
+    let adapter = Arc::new(MockRuntimeAdapter::with_failure());
+    let state = AppState::in_memory_with_adapter(adapter);
+    let app = create_app(state);
+
+    let project_id = create_test_project(&app).await;
+
+    // Initial deployment fails without a prior healthy release -> remains in 'failed'
+    let payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-initial-fail"
+    });
+    let create_req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let create_res = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_res.status(), StatusCode::CREATED);
+    let created = response_json(create_res.into_body()).await;
+    assert_eq!(created["status"], "failed");
+    let deployment_id = created["id"].as_str().unwrap();
+
+    // Trigger explicit rollback endpoint
+    let rollback_req = Request::builder()
+        .uri(format!("/deployments/{deployment_id}/rollback"))
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let rollback_res = app.clone().oneshot(rollback_req).await.unwrap();
+    assert_eq!(rollback_res.status(), StatusCode::OK);
+    let rolled_back = response_json(rollback_res.into_body()).await;
+    assert_eq!(rolled_back["status"], "rolled_back");
+
+    // Re-running rollback on already rolled-back deployment returns 409 Conflict
+    let conflict_req = Request::builder()
+        .uri(format!("/deployments/{deployment_id}/rollback"))
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let conflict_res = app.oneshot(conflict_req).await.unwrap();
+    assert_eq!(conflict_res.status(), StatusCode::CONFLICT);
+}

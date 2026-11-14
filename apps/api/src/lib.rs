@@ -114,6 +114,10 @@ pub fn create_app(state: AppState) -> Router {
             "/deployments/{id}",
             get(routes::deployments::get_deployment),
         )
+        .route(
+            "/deployments/{id}/rollback",
+            post(routes::deployments::rollback_deployment),
+        )
         .route("/builds/{id}", get(routes::builds::get_build))
         .route(
             "/webhooks/github",
