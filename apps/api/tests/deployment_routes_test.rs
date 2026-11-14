@@ -5,7 +5,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::Value;
 use shipyard_api::adapter::MockRuntimeAdapter;
-use shipyard_api::models::DeploymentStatus;
+use shipyard_api::models::{Deployment, DeploymentStatus, TargetType};
 use shipyard_api::{AppState, create_app};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -242,9 +242,101 @@ async fn test_deployment_state_transition_validation() {
     assert!(DeploymentStatus::Deploying.can_transition_to(&DeploymentStatus::Failed));
     assert!(DeploymentStatus::Failed.can_transition_to(&DeploymentStatus::RollingBack));
     assert!(DeploymentStatus::RollingBack.can_transition_to(&DeploymentStatus::RolledBack));
+    assert!(DeploymentStatus::Healthy.can_transition_to(&DeploymentStatus::Superseded));
 
     // Invalid jumps
     assert!(!DeploymentStatus::Queued.can_transition_to(&DeploymentStatus::Healthy));
     assert!(!DeploymentStatus::Healthy.can_transition_to(&DeploymentStatus::Deploying));
     assert!(!DeploymentStatus::RolledBack.can_transition_to(&DeploymentStatus::Healthy));
+    assert!(!DeploymentStatus::Superseded.can_transition_to(&DeploymentStatus::Healthy));
+}
+
+#[tokio::test]
+async fn test_subsequent_healthy_deployment_supersedes_previous() {
+    let app = create_app(AppState::in_memory());
+    let project_id = create_test_project(&app).await;
+
+    let first_payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-release-1"
+    });
+    let first_req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(first_payload.to_string()))
+        .unwrap();
+    let first_res = app.clone().oneshot(first_req).await.unwrap();
+    assert_eq!(first_res.status(), StatusCode::CREATED);
+    let first_json = response_json(first_res.into_body()).await;
+    let first_id = first_json["id"].as_str().unwrap();
+    assert_eq!(first_json["status"], "healthy");
+
+    let second_payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-release-2"
+    });
+    let second_req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(second_payload.to_string()))
+        .unwrap();
+    let second_res = app.clone().oneshot(second_req).await.unwrap();
+    assert_eq!(second_res.status(), StatusCode::CREATED);
+    let second_json = response_json(second_res.into_body()).await;
+    assert_eq!(second_json["status"], "healthy");
+
+    let get_first_req = Request::builder()
+        .uri(format!("/deployments/{first_id}"))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let get_first_res = app.oneshot(get_first_req).await.unwrap();
+    assert_eq!(get_first_res.status(), StatusCode::OK);
+    let refreshed_first = response_json(get_first_res.into_body()).await;
+    assert_eq!(refreshed_first["status"], "superseded");
+}
+
+#[tokio::test]
+async fn test_overlapping_active_deployment_returns_conflict() {
+    let state = AppState::in_memory();
+    let app = create_app(state.clone());
+    let project_id_str = create_test_project(&app).await;
+    let project_id = Uuid::parse_str(&project_id_str).unwrap();
+
+    // Seed an active deployment in progress
+    let active = Deployment {
+        id: Uuid::new_v4(),
+        project_id,
+        commit_sha: "sha-in-progress".to_string(),
+        target_type: TargetType::HostedEcs,
+        status: DeploymentStatus::Deploying,
+        created_at: chrono::Utc::now(),
+        started_at: Some(chrono::Utc::now()),
+        finished_at: None,
+        failure_reason: None,
+    };
+    state.store.create_deployment(active).await.unwrap();
+
+    let payload = serde_json::json!({
+        "project_id": project_id,
+        "commit_sha": "sha-overlapping"
+    });
+    let req = Request::builder()
+        .uri("/deployments")
+        .method("POST")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let json = response_json(res.into_body()).await;
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("active deployment in progress")
+    );
 }
